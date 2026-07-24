@@ -22,9 +22,19 @@ args = "Start application"
 name = "Start application"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "webview"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python main.py"
+args = "python server.py"
+waitForPort = 5000
 
-[workflows.workflow.metadata]
-outputType = "vnc"
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[deployment]
+deploymentTarget = "autoscale"
+run = ["python", "server.py"]
+build = ["bash", "-c", '''find . -not -path './.git/*' -exec touch {} \; 2>/dev/null; python -m pygbag --build .''']

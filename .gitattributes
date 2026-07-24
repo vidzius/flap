@@ -1,0 +1,2 @@
+build/web/workspace.apk filter=lfs diff=lfs merge=lfs -text
+build/web/workspace.tar.gz filter=lfs diff=lfs merge=lfs -text
