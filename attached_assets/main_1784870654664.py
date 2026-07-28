@@ -9,7 +9,6 @@ import json
 import math
 import os
 import sys
-import time
 
 # ── detect if running in browser ──
 WEB = sys.platform == "emscripten"
@@ -50,6 +49,8 @@ C_DIM    = (150, 165, 195)
 C_P1     = (255, 220,  40)   # player 1 yellow
 C_P2     = (100, 180, 255)   # player 2 blue
 
+SKINS = [("Classic", C_P1), ("Ice", (100,210,255)), ("Fire", (255,110,55)), ("Royal", (185,90,255))]
+
 GROUND_H = 80
 PIPE_GAP = 175
 PIPE_W   = 68
@@ -80,20 +81,6 @@ def write_save(d):
         pass
 
 save = load_save()
-
-RACE_PIPE_OPTIONS   = [10, 25, 50]
-race_pipe_total    = 10
-selected_race_pipes = 10
-skin_options       = ["yellow", "blue", "pink"]
-skin_colors        = {
-    "yellow": C_P1,
-    "blue": C_P2,
-    "pink": (255, 120, 180),
-}
-selected_skin      = "yellow"
-wait_skin_index    = 0
-finish_times       = {}
-race_results_open  = False
 
 # ─────────────────────────────────────────────
 #  DRAWING HELPERS
@@ -206,6 +193,7 @@ class Pipe:
         random.seed(seed)
         self.gap_y  = random.randint(160, H-GROUND_H-160)
         self.passed = False
+        self.uid = seed
 
     def update(self, spd):
         self.x -= spd
@@ -305,10 +293,12 @@ class Scene:
         self.speed     = 3.0
         self.particles = []
         self.ground_x  = 0.0
+        self.spawned_count = 0
 
     def spawn_pipe(self):
         self.pipe_seed += 1
         self.pipes.append(Pipe(W+10, self.pipe_seed))
+        self.spawned_count += 1
 
     def update(self):
         self.frame += 1
@@ -352,100 +342,90 @@ class Scene:
 #  PLAYER STATE
 # ─────────────────────────────────────────────
 class Player:
-    def __init__(self, col, name="You"):
+    def __init__(self, col, name="You", skin=0):
         self.base_col = col
-        self.name     = name
-        self.skin     = "yellow"
-        self.set_skin(self.skin)
+        self.name = name
+        self.skin = skin
         self.reset()
 
-    def reset(self):
-        self.x           = 90
-        self.y           = float(H//2)
-        self.vel         = 0.0
-        self.score       = 0
-        self.alive       = True
-        self.finished    = False
-        self.finish_time = None
-        self.hit_timer   = 0
-        self.radius      = 22
+    @property
+    def col(self):
+        return SKINS[self.skin % len(SKINS)][1]
 
-    def set_skin(self, skin):
-        self.skin = skin
-        self.col  = skin_colors.get(skin, self.base_col)
+    def reset(self):
+        self.x = 105.0
+        self.y = float(H//2)
+        self.vel = 0.0
+        self.score = 0
+        self.alive = True
+        self.radius = 22
+        self.hit_cooldown = 0
+        self.slow_frames = 0
+        self.distance = 0.0
+        self.passed_pipes = set()
+        self.finished = False
+        self.finish_time = None
 
     def flap(self):
         if self.alive and not self.finished:
             self.vel = FLAP_STR
 
-    def finish(self, scene):
-        self.finished = True
-        self.finish_time = round(time.time() - scene.start_time, 2)
-        finish_times[self.name] = self.finish_time
-        add_popup(f"{self.name} finished {self.finish_time:.2f}s!", C_COIN)
-        if self is p1:
-            global race_results_open
-            race_results_open = True
-
-    def update(self, scene, multiplayer=False):
-        if not self.alive or self.finished:
+    def register_hit(self, scene):
+        if self.hit_cooldown > 0 or self.finished:
             return
-        if self.hit_timer > 0:
-            self.hit_timer -= 1
+        self.hit_cooldown = FPS
+        self.slow_frames = FPS
+        # One hit costs 1.5 character widths of race progress.
+        self.distance = max(0.0, self.distance - self.radius * 3)
+        self.vel = min(self.vel, 1.5)
+        scene.emit(self.x, self.y, C_RED, n=14)
+        add_popup(f"{self.name}: pipe hit!", C_RED)
 
+    def update(self, scene, multiplayer=False, target_pipes=None, elapsed=0.0):
+        if self.finished:
+            return
+        if self.hit_cooldown > 0:
+            self.hit_cooldown -= 1
+        if self.slow_frames > 0:
+            self.slow_frames -= 1
         self.vel += GRAVITY
-        self.y   += self.vel
+        self.y += self.vel
+        speed_factor = 0.35 if self.slow_frames > 0 else 1.0
+        self.distance += scene.speed * speed_factor
 
-        for p in scene.pipes:
-            if not p.passed and p.x + PIPE_W < self.x:
-                p.passed = True
+        for pipe in scene.pipes:
+            if pipe.uid not in self.passed_pipes and pipe.x + PIPE_W < self.x:
+                self.passed_pipes.add(pipe.uid)
                 self.score += 1
                 scene.emit(self.x, self.y, C_ACCENT, n=10)
-                if self.score >= race_pipe_total:
-                    self.finish(scene)
+                if multiplayer and target_pipes and self.score >= target_pipes:
+                    self.finished = True
+                    self.finish_time = elapsed
+                    self.vel = 0
 
-        if self.y - self.radius <= 0 or self.y + self.radius >= H - GROUND_H:
-            if multiplayer:
-                if self.hit_timer <= 0:
-                    self.hit_timer = 60
-                    self.x = max(50, self.x - int(self.radius * 1.5))
-                    scene.emit(self.x, self.y, self.col, n=14)
-                    add_popup(f"{self.name} hit a pipe!", C_RED)
-            else:
-                self.alive = False
-                scene.emit(self.x, self.y, self.col, n=14)
-
+        boundary_hit = self.y - self.radius <= 0 or self.y + self.radius >= H - GROUND_H
+        pipe_hit = any(p.collides(self.x, self.y, self.radius) for p in scene.pipes)
         if multiplayer:
-            for p in scene.pipes:
-                if p.collides(self.x, self.y, self.radius):
-                    if self.hit_timer <= 0:
-                        self.hit_timer = 60
-                        self.x = max(50, self.x - int(self.radius * 1.5))
-                        scene.emit(self.x, self.y, self.col, n=14)
-                        add_popup(f"{self.name} hit a pipe!", C_RED)
-                    break
-        else:
-            for p in scene.pipes:
-                if p.collides(self.x, self.y, self.radius):
-                    self.alive = False
-                    scene.emit(self.x, self.y, self.col, n=14)
-                    break
+            if boundary_hit or pipe_hit:
+                self.register_hit(scene)
+                self.y = max(self.radius + 2, min(H-GROUND_H-self.radius-2, self.y))
+                self.vel = -3.0 if self.y > H//2 else 3.0
+        elif boundary_hit or pipe_hit:
+            self.alive = False
+            scene.emit(self.x, self.y, self.col, n=14)
 
     def draw(self, surf, ghost=False):
+        col = self.col
         if ghost:
-            s = pygame.Surface((self.radius*2+30,
-                                 self.radius*2+30),
-                                pygame.SRCALPHA)
-            draw_bird(s, self.radius+15, self.radius+15,
-                      self.radius, (*self.col, 140))
-            surf.blit(s, (int(self.x)-self.radius-15,
-                          int(self.y)-self.radius-15))
-        else:
-            draw_bird(surf, self.x, self.y, self.radius, self.col)
-        label = self.skin.upper()
-        t = F_SM.render(label, True, C_WHITE)
-        surf.blit(t, (int(self.x) - t.get_width() // 2,
-                      int(self.y) - self.radius - 20))
+            col = tuple(min(255, c + 45) for c in col)
+        draw_bird(surf, self.x, self.y, self.radius, col)
+        # Skin accents make equipped skins identifiable beyond body colour.
+        if self.skin == 1:
+            pygame.draw.circle(surf, C_WHITE, (int(self.x), int(self.y)), self.radius+3, 3)
+        elif self.skin == 2:
+            pygame.draw.line(surf, C_RED, (int(self.x)-16,int(self.y)-18), (int(self.x)+16,int(self.y)-18), 5)
+        elif self.skin == 3:
+            pygame.draw.circle(surf, C_ACCENT, (int(self.x), int(self.y)-self.radius-6), 5)
 
 # ─────────────────────────────────────────────
 #  WEBSOCKET MULTIPLAYER CLIENT
@@ -454,14 +434,14 @@ class Player:
 # Leave as empty string for single player only
 SERVER_URL = ""   # e.g. "wss://your-app.railway.app"
 
-ws_conn           = None
-other_y           = None
-other_score       = 0
-other_alive       = True
-other_skin        = "blue"
-other_finished    = False
+ws_conn      = None
+other_y      = None
+other_score  = 0
+other_alive  = True
+other_skin   = 1
+other_finished = False
 other_finish_time = None
-ws_connected      = False
+ws_connected = False
 
 async def ws_connect():
     global ws_conn, ws_connected
@@ -483,13 +463,14 @@ async def ws_send(y, score, alive):
         import websockets
         msg = json.dumps({"y": round(y,1),
                           "score": score,
-                          "alive": alive})
+                          "alive": alive, "skin": p1.skin, "finished": p1.finished,
+                          "finish_time": p1.finish_time, "race_pipes": race_pipes})
         await ws_conn.send(msg)
     except Exception:
         ws_connected = False
 
 async def ws_recv():
-    global ws_conn, ws_connected, other_y, other_score, other_alive
+    global ws_conn, ws_connected, other_y, other_score, other_alive, other_skin, other_finished, other_finish_time
     if not ws_conn or not ws_connected:
         return
     try:
@@ -499,6 +480,9 @@ async def ws_recv():
         other_y     = d.get("y",     other_y)
         other_score = d.get("score", other_score)
         other_alive = d.get("alive", other_alive)
+        other_skin = d.get("skin", other_skin)
+        other_finished = d.get("finished", other_finished)
+        other_finish_time = d.get("finish_time", other_finish_time)
     except Exception:
         pass
 
@@ -507,6 +491,9 @@ async def ws_recv():
 # ─────────────────────────────────────────────
 # screen names: menu | solo | multi | dead
 current = "menu"
+race_pipes = 10
+selected_skin = 0
+race_started_at = 0
 scene   = Scene()
 p1      = Player(C_P1, "You")
 p2      = Player(C_P2, "Rival")   # used in multi mode
@@ -517,11 +504,8 @@ btn_multi = Btn((W//2-130, 330, 260, 54), "MULTIPLAYER",C_PANEL)
 btn_scores= Btn((W//2-130, 400, 260, 54), "SCORES",     C_PANEL)
 btn_quit  = Btn((W//2-130, 470, 260, 54), "QUIT",       C_RED,   C_WHITE)
 
-btn_menu      = Btn((W//2-100, H//2+110, 200, 50), "MENU",      C_PANEL)
-btn_again     = Btn((W//2-100, H//2+ 50, 200, 50), "PLAY AGAIN",C_GREEN, C_BLACK)
-btn_start_race= Btn((W//2-100, H-170, 200, 50), "START RACE", C_GREEN, C_BLACK)
-btn_back_wait = Btn((W//2-100, H-100, 200, 50), "BACK", C_PANEL)
-btn_continue  = Btn((W//2-100, H-90, 200, 50), "CONTINUE", C_GREEN, C_BLACK)
+btn_menu  = Btn((W//2-100, H//2+110, 200, 50), "MENU",      C_PANEL)
+btn_again = Btn((W//2-100, H//2+ 50, 200, 50), "PLAY AGAIN",C_GREEN, C_BLACK)
 
 # input box for name / server url
 input_text  = ""
@@ -615,7 +599,7 @@ def draw_menu(surf, events):
     if btn_solo.clicked(events):
         start_solo()
     if btn_multi.clicked(events):
-        current = "wait_multi"
+        open_lobby()
     if btn_quit.clicked(events):
         write_save(save)
         pygame.quit()
@@ -623,38 +607,8 @@ def draw_menu(surf, events):
 
 # ─────────────────────────────────────────────
 #  DRAW SCORES
-def draw_wait_multi(surf, events):
-    global current, selected_race_pipes, selected_skin, wait_skin_index
-
-    draw_rect(surf,(15,22,55,220),(W//2-190,30,380,70),radius=14)
-    draw_center(surf,"MULTIPLAYER LOBBY",W//2,65,F_XL,C_ACCENT)
-    draw_text(surf,"Pick number of pipes for the race:",W//2-170,120,F_SM,C_WHITE,shadow=False)
-    for i, count in enumerate(RACE_PIPE_OPTIONS):
-        rect = pygame.Rect(W//2-150 + i*110, 150, 90, 50)
-        col = C_GREEN if count == selected_race_pipes else C_PANEL
-        draw_rect(surf,col,rect,radius=10,border=2,bcol=C_ACCENT)
-        draw_center(surf,str(count),rect.centerx,rect.centery,F_LG,C_BLACK)
-        if events and any(ev.type == pygame.MOUSEBUTTONDOWN and rect.collidepoint(ev.pos) for ev in events):
-            selected_race_pipes = count
-    draw_text(surf,"Choose your skin:",W//2-170,230,F_SM,C_WHITE,shadow=False)
-    for i, skin in enumerate(skin_options):
-        rect = pygame.Rect(W//2-150 + i*110, 260, 90, 50)
-        col = skin_colors.get(skin, C_PANEL)
-        border_col = C_ACCENT if skin == selected_skin else C_WHITE
-        draw_rect(surf,col,rect,radius=10,border=3,bcol=border_col)
-        draw_center(surf,skin.upper(),rect.centerx,rect.centery,F_SM,C_BLACK)
-        if events and any(ev.type == pygame.MOUSEBUTTONDOWN and rect.collidepoint(ev.pos) for ev in events):
-            selected_skin = skin
-    draw_text(surf,"Players can see each other's skins during the race.",W//2,340,F_SM,C_DIM,shadow=False)
-    btn_start_race.draw(surf)
-    btn_back_wait.draw(surf)
-    if btn_start_race.clicked(events):
-        start_multi()
-    if btn_back_wait.clicked(events):
-        current = "menu"
-
 # ─────────────────────────────────────────────
-#  DRAW SCORES
+btn_back = Btn((W//2-100, H-90, 200, 50), "Back", C_PANEL)
 
 def draw_scores(surf, events):
     global current
@@ -685,12 +639,52 @@ def start_solo():
     scene.spawn_pipe()
     current = "solo"
 
+def open_lobby():
+    global current
+    current = "lobby"
+
+btn_pipe10 = Btn((45, 245, 110, 46), "10 PIPES", C_PANEL)
+btn_pipe25 = Btn((185,245,110,46), "25 PIPES", C_PANEL)
+btn_pipe50 = Btn((325,245,110,46), "50 PIPES", C_PANEL)
+btn_skin_prev = Btn((55,390,70,44), "<", C_PANEL)
+btn_skin_next = Btn((355,390,70,44), ">", C_PANEL)
+btn_start_race = Btn((W//2-120,480,240,54), "START RACE", C_GREEN, C_BLACK)
+btn_lobby_back = Btn((W//2-90,550,180,46), "BACK", C_PANEL)
+btn_continue = Btn((W//2-110,510,220,52), "CONTINUE", C_GREEN, C_BLACK)
+
+def draw_lobby(surf, events):
+    global current, race_pipes, selected_skin
+    draw_gradient(surf,(0,0,W,H),(15,22,48),(40,70,130))
+    draw_center(surf,"MULTIPLAYER LOBBY",W//2,65,F_LG,C_ACCENT)
+    draw_center(surf,"Race length",W//2,195,F_MD,C_WHITE)
+    for b,n in ((btn_pipe10,10),(btn_pipe25,25),(btn_pipe50,50)):
+        b.col = C_GREEN if race_pipes == n else C_PANEL
+        b.draw(surf)
+        if b.clicked(events): race_pipes = n
+    draw_center(surf,"Equipped skin",W//2,340,F_MD,C_WHITE)
+    btn_skin_prev.draw(surf); btn_skin_next.draw(surf)
+    draw_bird(surf,W//2,412,28,SKINS[selected_skin][1])
+    draw_center(surf,SKINS[selected_skin][0],W//2,455,F_SM,C_ACCENT)
+    if btn_skin_prev.clicked(events): selected_skin=(selected_skin-1)%len(SKINS)
+    if btn_skin_next.clicked(events): selected_skin=(selected_skin+1)%len(SKINS)
+    # Rival preview; online skin updates from websocket, AI uses Ice.
+    draw_bird(surf, W//2+80, 135, 22, SKINS[other_skin % len(SKINS)][1])
+    draw_bird(surf, W//2-80, 135, 22, SKINS[selected_skin][1])
+    draw_center(surf,"You",W//2-80,170,F_SM,C_WHITE)
+    draw_center(surf,"Rival",W//2+80,170,F_SM,C_WHITE)
+    btn_start_race.draw(surf); btn_lobby_back.draw(surf)
+    if btn_start_race.clicked(events): start_multi()
+    if btn_lobby_back.clicked(events): current="menu"
+
 def start_multi():
-    global current, scene, p1, p2
+    global current, scene, p1, p2, race_started_at, other_finished, other_finish_time
     scene = Scene(seed=42)
-    p1    = Player(C_P1, "You")
-    p2    = Player(C_P2, "Rival")
+    p1 = Player(C_P1, "You", selected_skin)
+    p2 = Player(C_P2, "Rival", other_skin if ws_connected else 1)
     scene.spawn_pipe()
+    race_started_at = pygame.time.get_ticks()
+    other_finished = False
+    other_finish_time = None
     current = "multi"
 
 # ─────────────────────────────────────────────
@@ -698,44 +692,21 @@ def start_multi():
 # ─────────────────────────────────────────────
 def draw_solo(surf, events):
     global current
-    global current, other_y, other_score, other_alive, other_skin, other_finished, other_finish_time, race_results_open
+    update_clouds()
     scene.update()
     p1.update(scene)
-    p1.update(scene, multiplayer=True)
-    if ws_connected and other_y is not None:
-        p2.y           = other_y
-        p2.score       = other_score
-        p2.alive       = other_alive
-        p2.set_skin(other_skin)
-        p2.finished    = other_finished
-        p2.finish_time = other_finish_time
-        if other_finished:
-            finish_times[p2.name] = other_finish_time
-    else:
-        # simple AI: flap when below gap centre
-        for pipe in scene.pipes:
-            if pipe.x < p2.x + 120:
-                if p2.y > pipe.gap_y + 20:
-                    p2.flap()
-                break
-        p2.update(scene, multiplayer=True)
     scene.draw_bg(surf)
-    # draw rival as ghost
-    if p2.alive:
-        p2.draw(surf, ghost=not ws_connected)
     p1.draw(surf)
     draw_popups(surf)
     # HUD
-    draw_rect(surf,(0,0,0,140),(0,0,W,52),radius=0)
-    draw_center(surf,str(p1.score),W//2-60,25,F_LG,C_P1)
-    draw_center(surf,"vs",W//2,25,F_MD,C_WHITE)
-    draw_center(surf,str(p2.score),W//2+60,25,F_LG,C_P2)
-    # connection status
-    status = "ONLINE" if ws_connected else "VS AI"
-    scol   = C_GREEN if ws_connected else C_COIN
-    draw_text(surf,status,W-75,10,F_SM,scol,shadow=False)
+    draw_rect(surf,(0,0,0,130),(0,0,W,46),radius=0)
+    draw_center(surf,str(p1.score),W//2,22,F_LG,C_WHITE)
+    draw_text(surf,f"Best:{save['high_score']}",
+              W-120,10,F_SM,C_COIN,shadow=False)
+    spd = f"{scene.speed:.1f}x"
+    draw_text(surf,f"Speed:{spd}",8,10,F_SM,C_GREEN,shadow=False)
     # speed ramp
-    scene.speed = min(5.5, 3.0 + max(p1.score,p2.score)*0.08)
+    scene.speed = min(5.5, 3.0 + p1.score*0.08)
     # handle events
     for ev in events:
         if ev.type == pygame.KEYDOWN:
@@ -744,15 +715,81 @@ def draw_solo(surf, events):
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button==1:
             p1.flap()
     if not p1.alive:
-        won = p1.score >= p2.score
-        if won:
-            save["wins"] = save.get("wins",0)+1
         if p1.score > save["high_score"]:
             save["high_score"] = p1.score
         save["games"] = save.get("games",0)+1
         write_save(save)
-        current = "dead_multi"
-        if multi: start_multi()
+        current = "dead_solo"
+
+# ─────────────────────────────────────────────
+#  DRAW GAME (multi)
+# ─────────────────────────────────────────────
+def draw_multi(surf, events):
+    global current, other_y, other_score, other_alive
+    elapsed = (pygame.time.get_ticks() - race_started_at) / 1000.0
+    update_clouds(); scene.update()
+    p1.update(scene, multiplayer=True, target_pipes=race_pipes, elapsed=elapsed)
+    if ws_connected and other_y is not None:
+        p2.y, p2.score, p2.skin = other_y, other_score, other_skin
+        p2.finished, p2.finish_time = other_finished, other_finish_time
+    elif not p2.finished:
+        for pipe in scene.pipes:
+            if pipe.x < p2.x + 120:
+                if p2.y > pipe.gap_y + random.randint(-8,24): p2.flap()
+                break
+        p2.update(scene, multiplayer=True, target_pipes=race_pipes, elapsed=elapsed)
+
+    # Show progress differences without letting normal setbacks leave the screen.
+    lead = max(p1.distance, p2.distance)
+    p1.x = max(38, min(205, 155 - (lead-p1.distance)))
+    p2.x = max(38, min(205, 155 - (lead-p2.distance)))
+    scene.draw_bg(surf)
+    p2.draw(surf, ghost=not ws_connected); p1.draw(surf)
+    draw_popups(surf)
+    draw_rect(surf,(0,0,0,150),(0,0,W,58),radius=0)
+    draw_text(surf,f"You {min(p1.score,race_pipes)}/{race_pipes}",10,10,F_SM,p1.col,False)
+    draw_text(surf,f"Rival {min(p2.score,race_pipes)}/{race_pipes}",W-135,10,F_SM,p2.col,False)
+    draw_center(surf,f"{elapsed:0.1f}s",W//2,27,F_MD,C_WHITE)
+    if p1.slow_frames: draw_center(surf,"SLOWED",W//2,75,F_SM,C_RED)
+    for ev in events:
+        if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_SPACE,pygame.K_RETURN,pygame.K_UP,pygame.K_w): p1.flap()
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button==1: p1.flap()
+    if p1.finished or p2.finished:
+        current = "results_multi"
+
+def draw_race_results(surf, events):
+    global current
+    elapsed = (pygame.time.get_ticks() - race_started_at) / 1000.0
+    # Keep unfinished racers moving behind the live results popup.
+    update_clouds(); scene.update()
+    if not p1.finished:
+        p1.update(scene, multiplayer=True, target_pipes=race_pipes, elapsed=elapsed)
+    if not ws_connected and not p2.finished:
+        for pipe in scene.pipes:
+            if pipe.x < p2.x + 120:
+                if p2.y > pipe.gap_y + random.randint(-8,24): p2.flap()
+                break
+        p2.update(scene, multiplayer=True, target_pipes=race_pipes, elapsed=elapsed)
+    elif ws_connected:
+        p2.y, p2.score, p2.skin = other_y or p2.y, other_score, other_skin
+        p2.finished, p2.finish_time = other_finished, other_finish_time
+    scene.draw_bg(surf)
+    p2.draw(surf, ghost=not ws_connected); p1.draw(surf)
+    ov=pygame.Surface((W,H),pygame.SRCALPHA); ov.fill((0,0,0,175)); surf.blit(ov,(0,0))
+    draw_rect(surf,C_PANEL,(45,80,W-90,470),radius=16,border=2,bcol=C_ACCENT)
+    draw_center(surf,"FINISH TIMES",W//2,125,F_LG,C_ACCENT)
+    rows=[("You",p1.finish_time,p1.col),("Rival",p2.finish_time,p2.col)]
+    rows.sort(key=lambda r: r[1] if r[1] is not None else 999999)
+    for i,(name,t,col) in enumerate(rows):
+        y=195+i*78
+        draw_text(surf,f"{i+1}. {name}",85,y,F_MD,col)
+        draw_text(surf,f"{t:.2f} s" if t is not None else "RACING...",285,y,F_MD,C_WHITE)
+    all_done = p1.finished and p2.finished
+    draw_center(surf,"All players finished" if all_done else "Waiting for all players...",W//2,390,F_SM,C_GREEN if all_done else C_DIM)
+    if all_done:
+        btn_continue.draw(surf)
+        if btn_continue.clicked(events): current="lobby"
+
 # ─────────────────────────────────────────────
 #  DEAD SCREENS
 # ─────────────────────────────────────────────
@@ -793,110 +830,52 @@ async def main():
     global current, ws_connected
 
     # try to connect websocket if URL set
-    # panel
     if SERVER_URL:
-
-    draw_center(surf,"GAME OVER",W//2,H//2-130,F_XL,C_RED)
         await ws_connect()
-        # check scores button from menuasyncio.run(main())
-                W//2,H//2-35,F_MD,C_ACCENT)
 
-        for ev in events:
-        rcol   = C_GREEN if p1.score>=p2.score else C_RED
     while True:
-            if (ev.type == pygame.MOUSEBUTTONDOWN        await asyncio.sleep(0)   # required every frame for web
-    btn_menu.draw(surf)
         events = pygame.event.get()
-                    and current == "menu"        clock.tick(FPS)
-            if multi: start_multi()
         for ev in events:
-                    and btn_scores.rect.collidepoint(ev.pos)):        pygame.display.flip()
-        if multi: start_multi()
             if ev.type == pygame.QUIT:
-    if btn_menu.clicked(events):
-        current = "menu"
                 write_save(save)
-                current = "scores"
-#  MAIN ASYNC LOOP  (required for pygbag/web)
                 pygame.quit()
-        pygame.display.flip()                    and btn_scores.rect.collidepoint(ev.pos)):
-    global current, ws_connected
                 sys.exit()
-        clock.tick(FPS)                    and current == "menu"
-                pygame.quit()
 
-        await asyncio.sleep(0)   # required every frame for web            if (ev.type == pygame.MOUSEBUTTONDOWN
-                sys.exit()
         screen.fill(C_BG)
+
+        if   current == "menu":
+            draw_menu(screen, events)
+        elif current == "solo":
+            draw_solo(screen, events)
+        elif current == "lobby":
+            draw_lobby(screen, events)
+        elif current == "multi":
+            draw_multi(screen, events)
+            # send/receive websocket data
+            if ws_connected:
+                await ws_send(p1.y, p1.score, p1.alive)
+                await ws_recv()
+        elif current == "results_multi":
+            draw_race_results(screen, events)
+            if ws_connected:
+                await ws_send(p1.y, p1.score, p1.alive)
+                await ws_recv()
+        elif current == "dead_solo":
+            draw_dead(screen, events, multi=False)
+        elif current == "dead_multi":
+            draw_dead(screen, events, multi=True)
+        elif current == "scores":
+            draw_scores(screen, events)
+
+        # check scores button from menu
         for ev in events:
+            if (ev.type == pygame.MOUSEBUTTONDOWN
+                    and current == "menu"
+                    and btn_scores.rect.collidepoint(ev.pos)):
+                current = "scores"
 
+        pygame.display.flip()
+        clock.tick(FPS)
+        await asyncio.sleep(0)   # required every frame for web
 
-asyncio.run(main())        # check scores button from menu
-        screen.fill(C_BG)
-        if   current == "menu":
-            if (ev.type == pygame.MOUSEBUTTONDOWN        await asyncio.sleep(0)   # required every frame for web
-
-            draw_menu(screen, events)            draw_scores(screen, events)
-
-        elif current == "solo":        elif current == "scores":
-
-            draw_solo(screen, events)            draw_dead(screen, events, multi=True)
-
-        elif current == "multi":        elif current == "dead_multi":
-
-            draw_multi(screen, events)            draw_dead(screen, events, multi=False)
-            draw_solo(screen, events)            draw_dead(screen, events, multi=True)
-            # send/receive websocket data        elif current == "dead_solo":
-
-
-            draw_multi(screen, events)            draw_dead(screen, events, multi=False)
-            draw_multi(screen, events)            draw_dead(screen, events, multi=False)
-                await ws_send(p1.y, p1.score, p1.alive)
-
-            if ws_connected:                await ws_recv()
-                pygame.quit()
-
-            if ws_connected:                await ws_recv()            if ws_connected:                await ws_recv()
-
-            if ws_connected:                await ws_recv()
-        pygame.display.flip()                    and btn_scores.rect.collidepoint(ev.pos)):
-            # send/receive websocket data        elif current == "dead_solo":
-                await ws_send(p1.y, p1.score, p1.alive)
-
-
-            # send/receive websocket data        elif current == "dead_solo":
-            # send/receive websocket data        elif current == "dead_solo":
-                sys.exit()
-            if ws_connected:                await ws_recv()
-
-        clock.tick(FPS)                    and current == "menu"
-                await ws_send(p1.y, p1.score, p1.alive)            draw_multi(screen, events)            draw_dead(screen, events, multi=False)
-
-            if ws_connected:                await ws_recv()
-
-        elif current == "multi":        elif current == "dead_multi":
-
-        await asyncio.sleep(0)   # required every frame for web            if (ev.type == pygame.MOUSEBUTTONDOWN
-
-            draw_solo(screen, events)            draw_dead(screen, events, multi=True)
-
-        screen.fill(C_BG)
-        await asyncio.sleep(0)   # required every frame for web            if (ev.type == pygame.MOUSEBUTTONDOWN
-        for ev in events:        elif current == "solo":        elif current == "scores":
-
-
-
-            draw_menu(screen, events)            draw_scores(screen, events)
-        for ev in events:        elif current == "solo":        elif current == "scores":
-asyncio.run(main())        # check scores button from menu
-
-
-        if   current == "menu":
-
-
-
-
-        if   current == "menu":
-            draw_menu(screen, events)            draw_scores(screen, events)
-
-asyncio.run(main())        # check scores button from menu
+asyncio.run(main())
